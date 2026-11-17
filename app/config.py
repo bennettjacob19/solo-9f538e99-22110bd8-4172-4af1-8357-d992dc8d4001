@@ -34,6 +34,9 @@ SCHEDULER_TICK = _env_float("PIPELINE_SCHEDULER_TICK", "0.2")
 # 日志接口单次最多返回字节数
 LOG_MAX_BYTES = int(os.environ.get("PIPELINE_LOG_MAX_BYTES", str(1024 * 1024)))
 
+# 回收清理失败时的重试间隔（秒）；未删净会保留 reclaiming 状态并按此退避重试
+RECLAIM_RETRY_SECONDS = _env_float("PIPELINE_RECLAIM_RETRY_SECONDS", "5")
+
 
 def ensure_dirs() -> None:
     for path in (DATA_DIR, WORKDIR_ROOT, LOG_ROOT):

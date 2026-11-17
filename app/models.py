@@ -66,6 +66,8 @@ class BuildOut(BaseModel):
     finished_at: Optional[str]
     detail: Optional[str]
     steps: list[StepOut]
+    # 回收状态（None 表示从未受理）；构建原 status 始终保留供追溯
+    reclaim_status: Optional[str] = None
 
 
 class LogOut(BaseModel):
@@ -74,6 +76,18 @@ class LogOut(BaseModel):
     status: str
     truncated: bool
     content: str
+    # 受理回收后置为 reclaiming/reclaimed，此时 content 恒为空（不再读盘）
+    reclaim_status: Optional[str] = None
+
+
+class ReclaimOut(BaseModel):
+    id: int
+    build_status: str
+    reclaim_status: str  # none / reclaiming / reclaimed
+    attempts: int
+    requested_at: Optional[str]
+    finished_at: Optional[str]
+    detail: Optional[str]
 
 
 class CancelOut(BaseModel):

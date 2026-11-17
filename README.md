@@ -21,10 +21,18 @@ FastAPI + SQLite 实现的 DAG 构建流水线：接收至多 12 步的 JSON DAG
 | 未跑步骤不再启动、不误杀后来构建 | 恢复不恢复调度；身份不符（PID 复用）的进程绝不触碰 |
 | 重复取消不改终态 | 终态构建上的取消请求幂等忽略，返回说明，不写库 |
 | 逐步状态与日志 | `GET /builds/{id}` 全量状态；`GET /builds/{id}/steps/{sid}/logs`（支持 `?tail=N`） |
+| 按构建号回收工作目录与日志 | `POST /builds/{id}/reclaim`；仅受理构建及全部步骤已终态的记录 |
+| 回收保留原状态供追溯 | 回收只删文件，构建/步骤状态与记录原样保留，`reclaim_status` 独立呈现 |
+| 回收中/已回收日志可辨 | 受理后日志接口不再读盘（杜绝半删文件），明确返回 `reclaiming`/`reclaimed` |
+| 重复/并发回收状态一致 | `reclaims.build_id` 主键幂等，重复请求返回同一回收状态，不碰其他构建目录 |
+| 未删净不报完成 | 两个目录都确认不存在才置 `reclaimed`；失败退避重试，重启后自动续清 |
 
 步骤状态机：`pending → running → cleaning_up → succeeded|failed|cancelled|interrupted`，
 失败后代为 `skipped`。构建终态：全部成功 `succeeded`；有失败 `failed`；
 取消导致的终止 `cancelled`；重启中断 `interrupted`。
+
+回收状态机（独立于构建状态）：未受理 `none` → 已受理 `reclaiming` → 删净确认 `reclaimed`。
+`reclaiming` 在删除失败或进程重启后保持，由重试循环/启动恢复继续完成。
 
 ## 快速启动（Docker Compose）
 
@@ -70,6 +78,10 @@ curl -s -X POST localhost:8000/builds \
 curl -s localhost:8000/builds/1
 curl -s localhost:8000/builds/1/steps/compile/logs
 curl -s -X POST localhost:8000/builds/1/cancel
+
+# 回收（构建终态后）：删除工作目录与日志，保留状态供追溯
+curl -s -X POST localhost:8000/builds/1/reclaim   # 202 受理；重复调用 200 幂等
+curl -s localhost:8000/builds/1/reclaim           # 查询回收进度/结果
 ```
 
 ## API 一览
@@ -78,11 +90,26 @@ curl -s -X POST localhost:8000/builds/1/cancel
 | --- | --- | --- |
 | POST | `/builds` | 提交 DAG 构建（201 返回含逐步状态） |
 | GET | `/builds?limit=N` | 构建列表（新→旧） |
-| GET | `/builds/{id}` | 构建与全部步骤状态 |
+| GET | `/builds/{id}` | 构建与全部步骤状态（含 `reclaim_status`） |
 | POST | `/builds/{id}/cancel` | 整次取消（幂等） |
-| GET | `/builds/{id}/steps/{step_id}/logs?tail=N` | 步骤日志 |
+| POST | `/builds/{id}/reclaim` | 回收该构建工作目录与日志（202 新受理 / 200 已存在；未终态 409） |
+| GET | `/builds/{id}/reclaim` | 回收状态查询（`none`/`reclaiming`/`reclaimed`） |
+| GET | `/builds/{id}/steps/{step_id}/logs?tail=N` | 步骤日志（回收受理后返回 `reclaim_status`，content 为空） |
 | GET | `/health` | 健康检查与最近一次启动恢复报告 |
 | GET | `/docs` | Swagger UI |
+
+## 回收语义
+
+1. **受理条件**：构建及全部步骤均为终态；否则 409，不产生任何回收记录。
+   构建终态落库发生在所有步骤进程组清理与日志收尾完成之后，因此受理时
+   执行器已不再写该构建的目录。
+2. **删除范围**：仅 `workdir/<id>/` 与 `logs/<id>/` 两个精确路径；不持调度锁、
+   不占并行名额，不影响其他构建。
+3. **完成判定**：两个目录都确认不存在才置 `reclaimed`；删除失败按
+   `PIPELINE_RECLAIM_RETRY_SECONDS` 退避重试并在记录中累计 `attempts` 与原因；
+   进程重启后启动恢复自动接管未删净的回收，绝不出现"已回收但盘上有残留"。
+4. **可追溯**：回收不删除/不改写数据库中的构建与步骤记录，原终态、退出码、
+   时间戳原样保留；`reclaim_status` 字段独立呈现回收进度。
 
 ## 进程组与重启恢复的关键设计
 
@@ -104,9 +131,12 @@ curl -s -X POST localhost:8000/builds/1/cancel
 ```
 
 - `tests/test_validation.py`：DAG 校验、12 步上限、超时正数、进程身份识别。
+- `tests/test_reclaim.py`：回收路径清理助手（目录树/文件/缺失容错/符号链接不穿透）。
 - `tests/test_integration.py`：以真实 uvicorn 子进程端到端验证成功、失败跳过、
   慢子进程清理判失败、超时、并行上限 2、整次取消、重复取消幂等、慢清理不占
-  另一名额、重启恢复（含不误杀后来构建）、错误请求与文档接口。
+  另一名额、重启恢复（含不误杀后来构建）、错误请求与文档接口，以及回收全链路：
+  终态回收删目录且保留原状态、未终态 409、并发/重复受理幂等、回收中日志不读盘、
+  不影响其他构建、重启后续清未删净目录。
 
 ## 配置（环境变量）
 
@@ -118,3 +148,4 @@ curl -s -X POST localhost:8000/builds/1/cancel
 | `PIPELINE_TIMEOUT_CAP_SECONDS` | `86400` | 单步超时上限 |
 | `PIPELINE_TERM_GRACE_SECONDS` | `5` | SIGTERM 宽限 |
 | `PIPELINE_KILL_GRACE_SECONDS` | `60` | SIGKILL 后硬等上限 |
+| `PIPELINE_RECLAIM_RETRY_SECONDS` | `5` | 回收清理失败的重试间隔 |

@@ -38,6 +38,16 @@ CREATE TABLE IF NOT EXISTS steps (
     UNIQUE(build_id, step_uid),
     FOREIGN KEY(build_id) REFERENCES builds(id)
 );
+-- 回收记录：build_id 主键即幂等键；受理即 'reclaiming'，目录确认删净才 'reclaimed'
+CREATE TABLE IF NOT EXISTS reclaims (
+    build_id     INTEGER PRIMARY KEY,
+    status       TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    detail       TEXT,
+    requested_at TEXT NOT NULL,
+    finished_at  TEXT,
+    FOREIGN KEY(build_id) REFERENCES builds(id)
+);
 """
 
 
@@ -204,4 +214,36 @@ class Database:
         return await self.all(
             f"SELECT * FROM steps WHERE build_id IN ({placeholders}) ORDER BY id",
             build_ids,
+        )
+
+    # ---- 回收 -----------------------------------------------------------
+
+    async def create_reclaim(self, build_id: int, now: str) -> bool:
+        """INSERT OR IGNORE：并发/重复受理只会有一个真正落库。返回是否本次新建。"""
+        assert self._conn is not None
+        cur = await self._conn.execute(
+            "INSERT OR IGNORE INTO reclaims (build_id, status, requested_at) "
+            "VALUES (?, 'reclaiming', ?)",
+            (build_id, now),
+        )
+        return cur.rowcount > 0
+
+    async def get_reclaim(self, build_id: int) -> Optional[aiosqlite.Row]:
+        return await self.one("SELECT * FROM reclaims WHERE build_id=?", (build_id,))
+
+    async def list_pending_reclaims(self) -> list[aiosqlite.Row]:
+        return await self.all("SELECT * FROM reclaims WHERE status='reclaiming'")
+
+    async def update_reclaim_progress(self, build_id: int, detail: str) -> None:
+        """清理未完成时留痕：累计尝试次数与最近失败原因，状态保持 reclaiming。"""
+        await self.execute(
+            "UPDATE reclaims SET attempts=attempts+1, detail=? WHERE build_id=?",
+            (detail, build_id),
+        )
+
+    async def finish_reclaim(self, build_id: int, now: str) -> None:
+        await self.execute(
+            "UPDATE reclaims SET status='reclaimed', finished_at=?, detail=NULL "
+            "WHERE build_id=?",
+            (now, build_id),
         )

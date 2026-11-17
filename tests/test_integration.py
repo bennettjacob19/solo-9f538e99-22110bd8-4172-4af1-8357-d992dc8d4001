@@ -5,10 +5,12 @@
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -361,8 +363,6 @@ def test_restart_recovers_and_does_not_kill_new_build(tmp_path_factory):
 
 
 def _step_pid(data_dir: Path, build_id: int, step_uid: str) -> int:
-    import sqlite3
-
     conn = sqlite3.connect(data_dir / "pipeline.db")
     try:
         row = conn.execute(
@@ -399,3 +399,193 @@ def test_health_and_docs(server):
     assert health["status"] == "ok" and health["max_parallel"] == 2
     assert server.client.get("/docs").status_code == 200
     assert server.client.get("/openapi.json").status_code == 200
+
+
+# --------------------------------------------------------------- 10. 回收
+
+
+def wait_reclaim(client: httpx.Client, build_id: int, timeout: float = 15) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = client.get(f"/builds/{build_id}/reclaim")
+        assert r.status_code == 200, r.text
+        payload = r.json()
+        if payload["reclaim_status"] == "reclaimed":
+            return payload
+        time.sleep(0.1)
+    raise AssertionError(f"构建 {build_id} 回收未在 {timeout}s 内完成")
+
+
+def test_reclaim_terminal_build_deletes_dirs_and_keeps_status(server):
+    bid = submit(server.client, "reclaim-ok", [
+        step("gen", "mkdir -p out && echo data > out/a.txt && echo log-line"),
+    ])
+    detail = wait_build(server.client, bid)
+    assert detail["status"] == "succeeded"
+    assert detail["reclaim_status"] is None
+    workdir = server.data_dir / "workdir" / str(bid)
+    logdir = server.data_dir / "logs" / str(bid)
+    assert (workdir / "out" / "a.txt").exists()
+    assert (logdir / "gen.log").exists()
+
+    r = server.client.post(f"/builds/{bid}/reclaim")
+    assert r.status_code == 202, r.text
+    assert r.json()["reclaim_status"] == "reclaiming"
+    assert r.json()["build_status"] == "succeeded"
+
+    final = wait_reclaim(server.client, bid)
+    assert final["reclaim_status"] == "reclaimed"
+    assert final["build_status"] == "succeeded"
+    assert final["finished_at"]
+    assert not workdir.exists() and not logdir.exists()
+
+    # 原状态保留供追溯：构建/步骤状态不被回收改写
+    detail = server.client.get(f"/builds/{bid}").json()
+    assert detail["status"] == "succeeded"
+    assert detail["reclaim_status"] == "reclaimed"
+    assert detail["steps"][0]["status"] == "succeeded"
+
+    # 日志查询明确显示已回收，不再返回文件内容
+    log = server.client.get(f"/builds/{bid}/steps/gen/logs").json()
+    assert log["reclaim_status"] == "reclaimed"
+    assert log["status"] == "succeeded"
+    assert log["content"] == ""
+
+
+def test_reclaim_rejects_nonterminal_and_unknown(server):
+    assert server.client.post("/builds/999999/reclaim").status_code == 404
+    assert server.client.get("/builds/999999/reclaim").status_code == 404
+
+    bid = submit(server.client, "reclaim-running", [step("slow", "sleep 8")])
+    r = server.client.post(f"/builds/{bid}/reclaim")
+    assert r.status_code == 409 and "终态" in r.json()["detail"]
+    # 未受理：不产生回收记录，工作目录原样保留
+    assert server.client.get(f"/builds/{bid}/reclaim").json()["reclaim_status"] == "none"
+    assert (server.data_dir / "workdir" / str(bid)).exists()
+
+    server.client.post(f"/builds/{bid}/cancel")
+    wait_build(server.client, bid, timeout=20)
+    r = server.client.post(f"/builds/{bid}/reclaim")
+    assert r.status_code == 202
+    assert wait_reclaim(server.client, bid)["reclaim_status"] == "reclaimed"
+
+
+def test_reclaim_idempotent_and_concurrent(server):
+    bid = submit(server.client, "reclaim-idem", [step("a", "echo hi")])
+    wait_build(server.client, bid)
+
+    # 并发重复受理：只有一个请求真正创建记录，响应状态一致
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        rs = list(pool.map(
+            lambda _: server.client.post(f"/builds/{bid}/reclaim"), range(4)
+        ))
+    assert all(r.status_code in (200, 202) for r in rs)
+    assert sum(1 for r in rs if r.status_code == 202) == 1
+    assert {r.json()["id"] for r in rs} == {bid}
+    assert {r.json()["reclaim_status"] for r in rs} <= {"reclaiming", "reclaimed"}
+
+    final = wait_reclaim(server.client, bid)
+    # 已完成后再重复：幂等返回当前状态，不重置时间戳、不重新受理
+    again = server.client.post(f"/builds/{bid}/reclaim")
+    assert again.status_code == 200
+    assert again.json()["reclaim_status"] == "reclaimed"
+    assert again.json()["finished_at"] == final["finished_at"]
+    assert again.json()["requested_at"] == final["requested_at"]
+
+
+def test_log_endpoint_shows_reclaiming_without_reading_files(server):
+    """受理后、删净前的中间态：日志接口明确报 reclaiming 且不读盘。"""
+    bid = submit(server.client, "reclaim-inflight", [step("a", "echo marker-line")])
+    wait_build(server.client, bid)
+    log_file = server.data_dir / "logs" / str(bid) / "a.log"
+    assert "marker-line" in log_file.read_text()
+
+    # 模拟清理失败重试中的 reclaiming 记录（无后台任务，状态稳定）
+    conn = sqlite3.connect(server.data_dir / "pipeline.db", timeout=10)
+    try:
+        conn.execute(
+            "INSERT INTO reclaims (build_id, status, attempts, detail, requested_at) "
+            "VALUES (?, 'reclaiming', 2, '模拟清理失败', '2026-01-01T00:00:00+00:00')",
+            (bid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    log = server.client.get(f"/builds/{bid}/steps/a/logs").json()
+    assert log["reclaim_status"] == "reclaiming"
+    assert log["status"] == "succeeded"
+    assert log["content"] == ""  # 文件仍在盘上，但绝不读到半删内容
+    assert log_file.exists()
+    shown = server.client.get(f"/builds/{bid}/reclaim").json()
+    assert shown["reclaim_status"] == "reclaiming"
+    assert shown["attempts"] == 2
+
+    # 对已存在的 reclaiming 记录再受理：幂等返回并拉起清理任务直至删净
+    r = server.client.post(f"/builds/{bid}/reclaim")
+    assert r.status_code == 200
+    assert r.json()["reclaim_status"] == "reclaiming"
+    final = wait_reclaim(server.client, bid)
+    assert final["reclaim_status"] == "reclaimed"
+    assert not (server.data_dir / "workdir" / str(bid)).exists()
+    assert not log_file.exists()
+
+
+def test_reclaim_does_not_touch_other_builds(server):
+    bid_a = submit(server.client, "reclaim-a", [step("x", "echo keep-a | tee note.txt")])
+    bid_b = submit(server.client, "reclaim-b", [step("y", "echo keep-b | tee note.txt")])
+    wait_build(server.client, bid_a)
+    wait_build(server.client, bid_b)
+
+    assert server.client.post(f"/builds/{bid_a}/reclaim").status_code == 202
+    wait_reclaim(server.client, bid_a)
+
+    assert not (server.data_dir / "workdir" / str(bid_a)).exists()
+    # 另一构建的工作目录与日志完整可读
+    assert (server.data_dir / "workdir" / str(bid_b) / "note.txt").exists()
+    log_b = server.client.get(f"/builds/{bid_b}/steps/y/logs").json()
+    assert log_b["reclaim_status"] is None
+    assert "keep-b" in log_b["content"]
+    detail_b = server.client.get(f"/builds/{bid_b}").json()
+    assert detail_b["reclaim_status"] is None
+
+
+def test_reclaim_resumes_after_restart(tmp_path_factory):
+    """受理后进程退出、目录未删净：重启必须继续清理，删净后才报完成。"""
+    data_dir = tmp_path_factory.mktemp("reclaim-restart")
+    port = _free_port()
+    srv = ServerHarness(data_dir, port)
+    srv.start()
+    try:
+        bid = submit(srv.client, "reclaim-pending", [step("a", "echo hello")])
+        wait_build(srv.client, bid)
+    finally:
+        srv.stop()
+
+    # 模拟"受理后进程即退出"：直接落一条 reclaiming 记录，目录仍留在盘上
+    conn = sqlite3.connect(data_dir / "pipeline.db")
+    try:
+        conn.execute(
+            "INSERT INTO reclaims (build_id, status, requested_at) "
+            "VALUES (?, 'reclaiming', '2026-01-01T00:00:00+00:00')",
+            (bid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert (data_dir / "workdir" / str(bid)).exists()
+    assert (data_dir / "logs" / str(bid)).exists()
+
+    srv2 = ServerHarness(data_dir, port)
+    srv2.start()
+    try:
+        assert srv2.client.get("/health").json()["reclaim_resumed"] == 1
+        final = wait_reclaim(srv2.client, bid)
+        assert final["reclaim_status"] == "reclaimed"
+        assert not (data_dir / "workdir" / str(bid)).exists()
+        assert not (data_dir / "logs" / str(bid)).exists()
+        log = srv2.client.get(f"/builds/{bid}/steps/a/logs").json()
+        assert log["reclaim_status"] == "reclaimed"
+        assert log["content"] == ""
+    finally:
+        srv2.stop()
